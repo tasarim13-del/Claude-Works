@@ -1,6 +1,6 @@
 /*
 ================================================================================
-  PRO Batch v0.1  -  Sahnedeki tum kameralari sirayla render eden gece paneli
+  PRO Batch v0.2  -  Sahnedeki tum kameralari sirayla render eden gece paneli
   Hedef: 3ds Max 2024+ / V-Ray (tum render motorlariyla calisir)
 ================================================================================
   KULLANIM
@@ -16,8 +16,11 @@
   - Istege bagli: is bitince bilgisayar 5 dk sonra kapanir.
     (Iptal icin: Baslat > Calistir > shutdown /a)
   - Render ayarlari: aktif Render Setup (V-Ray dahil) aynen kullanilir;
-    her kamera F9 ile ayni yoldan render edilir. Is bitince Render Setup
-    ve aktif viewport eski haline doner.
+    her kamera F9 ile ayni yoldan render edilir.
+  - Kayit: V-Ray kullaniliyorsa goruntu V-Ray VFB'den alinir (Display
+    Correction, exposure, LUT, denoiser dahil - VFB'de ne gorurseniz o).
+  - Alpha istege bagli; kapaliyken PNG/TIF siyah zeminli kaydedilir.
+  - Is bitince Render Setup, aktif viewport ve zaman cizelgesi eski haline doner.
 ================================================================================
 */
 
@@ -53,28 +56,76 @@ fn PB_timeStr sec =
 	(formattedPrint h format:"02d") + ":" + (formattedPrint m format:"02d") + ":" + (formattedPrint s format:"02d")
 )
 
--- Tek kamerayi AKTIF RENDER SETUP ile (F9 ile ayni yol) render eder.
--- V-Ray ayarlari, VFB, render element'leri ve cikti secenekleri aynen kullanilir.
+-- PNG/TIF icindeki alpha'yi renklere dokunmadan kaldirir (siyah zemine yassilastirir).
+fn PB_flatten f =
+(
+	local ext = toLower (getFilenameType f)
+	if ext != ".png" and ext != ".tif" and ext != ".tiff" then false
+	else
+	(
+		local bytes = (dotNetClass "System.IO.File").ReadAllBytes f
+		local ms = dotNetObject "System.IO.MemoryStream" bytes
+		local img = (dotNetClass "System.Drawing.Image").FromStream ms
+		local w = img.Width
+		local h = img.Height
+		local bmp = dotNetObject "System.Drawing.Bitmap" w h (dotNetClass "System.Drawing.Imaging.PixelFormat").Format24bppRgb
+		local g = (dotNetClass "System.Drawing.Graphics").FromImage bmp
+		g.Clear (dotNetClass "System.Drawing.Color").Black
+		g.DrawImage img 0 0 w h
+		g.Dispose()
+		img.Dispose()
+		ms.Dispose()
+		local fmt = if ext == ".png" then (dotNetClass "System.Drawing.Imaging.ImageFormat").Png else (dotNetClass "System.Drawing.Imaging.ImageFormat").Tiff
+		bmp.Save f fmt
+		bmp.Dispose()
+		true
+	)
+)
+
+fn PB_isVRay = ( matchPattern (renderers.production as string) pattern:"*V_Ray*" )
+
+-- Tek kareyi aktif Render Setup ile (F9 ile ayni yol) render edip kaydeder.
+-- V-Ray ise goruntu V-Ray VFB'den kaydedilir: VFB'de gordugunuzle birebir ayni
+-- (Display Correction, exposure, LUT, denoiser vb. katmanlar dahil).
+fn PB_renderOne outFile keepAlpha =
+(
+	local vr = PB_isVRay()
+	rendTimeType = 1
+	if vr then rendSaveFile = false
+	else ( rendSaveFile = true; rendOutputFilename = outFile )
+	max quick render
+	if vr do vfbControl #saveimage outFile
+	if not keepAlpha and doesFileExist outFile do ( try ( PB_flatten outFile ) catch ( format "[PRO Batch] alpha kaldirilamadi: %\n" (getCurrentException()) ) )
+	doesFileExist outFile
+)
+
+-- Bir kamerayi render eder (tek kare ya da animasyon araligi, kare kare).
 -- Donus: #(durum, sureSn, mesaj)  durum: #ok / #error
-fn PB_renderCam c outFile animMode w h vfbSave =
+fn PB_renderCam c outFile animMode w h keepAlpha =
 (
 	local t0 = timeStamp()
 	local st = #ok
 	local msg = ""
 	try
 	(
-		rendTimeType = (if animMode then 2 else 1)
-		rendSaveFile = true
-		rendOutputFilename = outFile
 		renderWidth = w
 		renderHeight = h
 		viewport.setCamera c
 		try ( rendUseActiveView = true ) catch ()
-		max quick render
-		if vfbSave and not animMode do
+		if not animMode then
 		(
-			local vf = (getFilenamePath outFile) + (getFilenameFile outFile) + "_vfb" + (getFilenameType outFile)
-			try ( vfbControl #saveimage vf ) catch ()
+			if not (PB_renderOne outFile keepAlpha) do ( st = #error; msg = "dosya olusmadi" )
+		)
+		else
+		(
+			local base = (getFilenamePath outFile) + (getFilenameFile outFile)
+			local ext = getFilenameType outFile
+			for t = animationRange.start to animationRange.end do
+			(
+				sliderTime = t
+				local fr = formattedPrint ((t as integer) / TicksPerFrame) format:"04d"
+				if not (PB_renderOne (base + fr + ext) keepAlpha) do ( st = #error; msg = "kare " + fr + " olusmadi" )
+			)
 		)
 	)
 	catch
@@ -90,7 +141,7 @@ fn PB_renderCam c outFile animMode w h vfbSave =
 -- Render Setup + aktif viewport durumunu sakla / geri yukle
 fn PB_saveState =
 (
-	#(rendTimeType, rendSaveFile, rendOutputFilename, renderWidth, renderHeight, viewport.getType(), viewport.getCamera())
+	#(rendTimeType, rendSaveFile, rendOutputFilename, renderWidth, renderHeight, viewport.getType(), viewport.getCamera(), sliderTime)
 )
 
 fn PB_restoreState s =
@@ -100,11 +151,12 @@ fn PB_restoreState s =
 	try ( rendOutputFilename = s[3] ) catch ()
 	try ( renderWidth = s[4]; renderHeight = s[5] ) catch ()
 	try ( if s[7] != undefined and isValidNode s[7] then viewport.setCamera s[7] else viewport.setType s[6] ) catch ()
+	try ( sliderTime = s[8] ) catch ()
 )
 
 try ( destroyDialog PB_Roll ) catch ()
 
-rollout PB_Roll "PRO Batch v0.1 - Gece Render" width:340
+rollout PB_Roll "PRO Batch v0.2 - Gece Render" width:340
 (
 	local camNodes = #()
 
@@ -123,8 +175,8 @@ rollout PB_Roll "PRO Batch v0.1 - Gece Render" width:340
 		button btnDir "..." width:30 align:#right
 		edittext etPrefix "Dosya on eki" width:200 align:#left
 		dropdownlist ddlFmt "Format" items:#("png", "jpg", "exr", "tif", "tga") width:80 align:#left
-		label lblInfo "Render ayarlari: aktif Render Setup (V-Ray) aynen kullanilir." align:#left
-		checkbox chkVfb "V-Ray VFB'den ayrica kaydet (renk duzeltmeleriyle, _vfb)" checked:false
+		label lblInfo "Render: aktif Render Setup. Kayit: V-Ray VFB (VFB'de ne gorurseniz o)." align:#left
+		checkbox chkAlpha "Seffaf arka plani koru (alpha)" checked:false tooltip:"Kapaliyken PNG/TIF alpha'siz, siyah zeminli kaydedilir."
 	)
 
 	group "Cozunurluk ve Kareler"
@@ -275,7 +327,7 @@ rollout PB_Roll "PRO Batch v0.1 - Gece Render" width:340
 					lblStatus.text = "Test render: " + c.name
 					local saved = PB_saveState()
 					renderSceneDialog.close()
-					local r = PB_renderCam c f false (amax w 16) (amax h 16) false
+					local r = PB_renderCam c f false (amax w 16) (amax h 16) chkAlpha.checked
 					PB_restoreState saved
 					if r[1] == #ok then lblStatus.text = "Test tamam (" + (PB_timeStr r[2]) + "): " + f
 					else lblStatus.text = "Test basarisiz: " + (r[1] as string) + " - Listener'a bakin."
@@ -326,7 +378,7 @@ rollout PB_Roll "PRO Batch v0.1 - Gece Render" width:340
 					(
 						local f = outPathFor c d
 						lblStatus.text = "(" + (i as string) + "/" + (idx.count as string) + ") " + c.name
-						local r = PB_renderCam c f animMode w h chkVfb.checked
+						local r = PB_renderCam c f animMode w h chkAlpha.checked
 						if r[1] == #ok then
 						(
 							okN += 1
